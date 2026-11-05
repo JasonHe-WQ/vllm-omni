@@ -136,8 +136,44 @@ class TestInputValidation:
         with pytest.raises(ValueError, match="No latent or hidden_states"):
             llm2tts([bad], prompt=None)
 
+    @pytest.mark.parametrize("stop_id", [151704, 151645])
+    def test_terminal_only_output_still_requires_hidden_payload(self, stop_id) -> None:
+        bad = _make_thinker_output(prompt_token_ids=[10, 11], output_token_ids=[stop_id], text="")
+        with pytest.raises(ValueError, match="No latent or hidden_states"):
+            llm2tts([bad], prompt=None)
+
 
 class TestBasicShape:
+    @pytest.mark.parametrize("stop_id", [151704, 151645])
+    def test_terminal_only_output_has_explicit_empty_condition(self, stop_id) -> None:
+        # The sampled stop token was never fed through the Thinker: all hidden
+        # rows belong to the prompt, as in a first-token EOS from a long input.
+        source = _make_thinker_output(
+            prompt_token_ids=[10, 11, 12],
+            output_token_ids=[stop_id],
+            text="",
+            hidden_states=torch.zeros(3, _HIDDEN_DIM, dtype=torch.bfloat16),
+        )
+        result = llm2tts([source], prompt=None)[0]
+        buffer = result["model_intermediate_buffer"]
+        assert result["prompt_token_ids"] == [0, 0]
+        assert buffer["ids"]["tts"] == []
+        assert buffer["hidden_states"]["tts"] == []
+        assert buffer["meta"]["next_stage_prompt_len"] == 2
+        assert buffer["llm_output_token_ids"] == [stop_id]
+
+    def test_immediate_tts_boundary_has_explicit_empty_condition(self) -> None:
+        source = _make_thinker_output(
+            prompt_token_ids=[10, 11],
+            output_token_ids=[151703, 151704],
+            text="",
+            hidden_states=torch.zeros(3, _HIDDEN_DIM),
+        )
+        result = llm2tts([source], prompt=None)[0]
+        assert result["prompt_token_ids"] == [0, 0]
+        assert result["model_intermediate_buffer"]["ids"]["tts"] == []
+        assert result["model_intermediate_buffer"]["hidden_states"]["tts"] == []
+
     def test_request_level_multimodal_output_feeds_orchestrator_bridge(self) -> None:
         hidden = torch.zeros((2, _HIDDEN_DIM))
         thinker_output = _make_thinker_output(

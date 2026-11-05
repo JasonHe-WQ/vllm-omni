@@ -65,6 +65,7 @@ class MiniCPMO45Token2wav:
         n_timesteps: int = 10,
         device: str | torch.device | None = None,
         drop_upstream_chunk_att_buffers: bool = False,
+        audio_tokenizer_device: str | torch.device | None = None,
     ):
         self.float16 = float16
         self.n_timesteps = n_timesteps
@@ -75,6 +76,7 @@ class MiniCPMO45Token2wav:
             device=self.device,
             n_timesteps=n_timesteps,
             drop_upstream_chunk_att_buffers=drop_upstream_chunk_att_buffers,
+            audio_tokenizer_device=audio_tokenizer_device,
         )
         # Eager-load so construction failures surface at init time (same as
         # the external Token2wav package), not on the first request.
@@ -83,6 +85,7 @@ class MiniCPMO45Token2wav:
         # Mutable streaming fields expected by MiniCPM's long-form path.
         self.stream_cache: Any | None = None
         self.hift_cache_dict: dict[str, torch.Tensor] = {}
+        self._stream_state: _StreamState | None = None
 
         # The external ``stepaudio2.Token2wav`` class builds ``speech_window``
         # eagerly in ``__init__``. ``StepAudio2Token2WavCore`` only creates it
@@ -146,6 +149,7 @@ class MiniCPMO45Token2wav:
         """
         state = _StreamState()
         self._core.setup_stream_for(prompt_wav, state)
+        self._stream_state = state
         self.stream_cache = state.stream_cache
         self.hift_cache_dict = state.hift_cache_dict
         return self.stream_cache, self.hift_cache_dict
@@ -161,8 +165,9 @@ class MiniCPMO45Token2wav:
         if self.stream_cache is None:
             raise ValueError("stream_cache is not set")
 
-        state = _StreamState()
-        state.setup_done = True
+        state = self._stream_state
+        if state is None:
+            raise ValueError("stream conditioning is not set; call set_stream_cache() first")
         state.stream_cache = self.stream_cache
         state.hift_cache_dict = self.hift_cache_dict
 

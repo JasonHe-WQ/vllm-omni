@@ -75,6 +75,7 @@ Supported fields:
 | --- | --- |
 | `profiler` | Profiler backend. Supported values: `torch`, `cuda`. Use `torch` for `trace.json`, Excel operator tables, and optional memory snapshots. Use `cuda` for Nsight Systems only. |
 | `torch_profiler_dir` | Output directory for torch-profiler artifacts. Required when `profiler: torch`. |
+| `torch_profiler_activities` | Worker activities, for example `["CUDA"]` to omit CPU operator recording. Explicit `activities` passed to the Python profiler factory take precedence; when unset, the platform default is used. |
 | `torch_profiler_use_gzip` | Compress `trace_rank*.json` into `trace_rank*.json.gz`. |
 | `torch_profiler_record_shapes` | Record input shapes and add a `by_shape` sheet to `ops_rank*.xlsx`. |
 | `torch_profiler_with_stack` | Record call stacks, add a `by_stack` sheet to `ops_rank*.xlsx`, and export `stacks_cpu_rank*.txt` and `stacks_cuda_rank*.txt`. |

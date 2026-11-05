@@ -18,11 +18,12 @@ from vllm.profiler.wrapper import WorkerProfiler
 logger = init_logger(__name__)
 
 # NPU has its custom profiler
-TorchProfilerActivity = Literal["CPU", "CUDA", "XPU", "NPU", "MUSA"]
+TorchProfilerActivity = Literal["CPU", "CUDA", "XPU", "PrivateUse1", "NPU", "MUSA"]
 TorchProfilerActivityMap = {
     "CPU": torch.profiler.ProfilerActivity.CPU,
     "CUDA": torch.profiler.ProfilerActivity.CUDA,
     "XPU": torch.profiler.ProfilerActivity.XPU,
+    "PrivateUse1": torch.profiler.ProfilerActivity.PrivateUse1,
     "MUSA": torch.profiler.ProfilerActivity.CUDA,
 }
 
@@ -51,7 +52,10 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         super().__init__(profiler_config)
 
         if activities is None:
-            activities = self._get_default_activities()
+            # Worker factories normally omit this argument. Honor the shared
+            # vLLM config before falling back to the platform's activities.
+            configured = getattr(profiler_config, "torch_profiler_activities", None)
+            activities = list(configured) if configured is not None else self._get_default_activities()
 
         self.local_rank = local_rank
         self.profiler_config = profiler_config
@@ -289,7 +293,7 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
         """Resolve the memory backend that supports history/snapshot APIs."""
         backend_specs = [
             ("CUDA", self._has_cuda_like_activity(), getattr(torch, "cuda", None)),
-            ("NPU", "NPU" in self._activities, getattr(torch, "npu", None)),
+            ("NPU", bool({"NPU", "PrivateUse1"}.intersection(self._activities)), getattr(torch, "npu", None)),
             ("XPU", "XPU" in self._activities, getattr(torch, "xpu", None)),
             ("MUSA", "MUSA" in self._activities, getattr(torch, "musa", None)),
         ]

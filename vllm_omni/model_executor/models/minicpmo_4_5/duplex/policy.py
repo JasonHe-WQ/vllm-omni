@@ -28,8 +28,12 @@ class MiniCPMO45DuplexWindowConfig:
     context_max_units: int = 24
 
     @classmethod
-    def from_mapping(cls, value: object) -> MiniCPMO45DuplexWindowConfig:
-        source = value if isinstance(value, dict) else {}
+    def from_mapping(
+        cls, value: object, *, defaults: MiniCPMO45DuplexWindowConfig | None = None
+    ) -> MiniCPMO45DuplexWindowConfig:
+        source = defaults.as_dict() if defaults is not None else {}
+        if isinstance(value, dict):
+            source.update(value)
 
         def integer(name: str, default: int) -> int:
             raw = source.get(name, default)
@@ -56,6 +60,35 @@ class MiniCPMO45DuplexWindowConfig:
         if config.basic_window_low_tokens >= config.basic_window_high_tokens:
             raise ValueError("basic_window_low_tokens must be less than basic_window_high_tokens")
         return config
+
+    @classmethod
+    def from_hf_config(cls, hf_config: object) -> MiniCPMO45DuplexWindowConfig:
+        """Read deployment watermarks shared by startup sizing and session defaults.
+
+        Values are total-token session watermarks. Startup keeps the legacy
+        extra 96-token prefix reserve rather than changing existing 8k sizing.
+        """
+        values = {}
+        for field, attribute in (
+            ("basic_window_high_tokens", "duplex_window_high_tokens"),
+            ("basic_window_low_tokens", "duplex_window_low_tokens"),
+        ):
+            value = getattr(hf_config, attribute, None)
+            if value is not None:
+                values[field] = value
+        return cls.from_mapping(values)
+
+    def startup_geometry(self, *, block_size: int, max_model_len: int):
+        """Keep the legacy prefix cushion in the admission/cache sizing spec."""
+        from .window_plan import DuplexWindowGeometry
+
+        return DuplexWindowGeometry(
+            prefix_tokens=96,
+            window_tokens=self.basic_window_low_tokens,
+            high_watermark_tokens=self.basic_window_high_tokens,
+            block_size=block_size,
+            max_model_len=max_model_len,
+        )
 
     def as_dict(self) -> dict[str, int | str]:
         return {

@@ -1261,6 +1261,59 @@ def test_engine_core_events_reach_native_phase_split(make_state):
     assert record["vllm_num_preemptions"] == finished.num_preemptions
 
 
+@pytest.mark.parametrize("with_scheduler_events", [True, False])
+def test_native_phase_split_reaches_serialized_stage_snapshot(with_scheduler_events):
+    from vllm_omni.engine.stage_pool import StagePool
+    from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionStreamResponse
+    from vllm_omni.metrics import OrchestratorAggregator
+
+    processor = _stats_processor(_make_text_stage_state())
+    events = (
+        [EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0), EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25)]
+        if with_scheduler_events
+        else None
+    )
+    processor.process_outputs(
+        [_stats_output(events=events)], engine_core_timestamp=1.75, iteration_stats=IterationStats()
+    )
+    final = processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.LENGTH)],
+        engine_core_timestamp=3.0,
+        iteration_stats=IterationStats(),
+    ).request_outputs
+    aggregate = OrchestratorAggregator(num_stages=3, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=2)
+    yielded = SimpleNamespace(metrics=None, final_output_type="text")
+    for stage_id, stage_processor in ((0, processor), (2, None)):
+        # Stage 2 has no observed engine-core phase events. Its missing values
+        # must remain separate from the real stage-0 split in the same response.
+        pool = StagePool(stage_id, [SimpleNamespace(final_output_type="text")], output_processor=stage_processor)
+        metrics = pool.build_stage_metrics(final, submit_ts=1.0, request_timestamp=1.0, replica_id=0)
+        aggregate.process_stage_metrics(
+            result={"metrics": metrics},
+            stage_type="llm",
+            stage_id=stage_id,
+            req_id="r",
+            engine_outputs=final,
+            finished=True,
+            final_output_type="text",
+            output_to_yield=yielded,
+        )
+
+    # This is the response model/serialization used by the SSE endpoint.
+    chunk = OmniChatCompletionStreamResponse(
+        id="phase-test", created=1, model="test", choices=[], metrics=yielded.metrics
+    )
+    restored = OmniChatCompletionStreamResponse.model_validate_json(chunk.model_dump_json(exclude_unset=True))
+    stages = restored.metrics["stage_metrics"]
+    assert {field: stages["0"][field] for field in _PHASE_KEYS} == {
+        "vllm_queued_ms": 250.0 if with_scheduler_events else None,
+        "vllm_prefill_ms": 500.0 if with_scheduler_events else None,
+        "vllm_decode_ms": 1250.0,
+        "vllm_num_preemptions": 0 if with_scheduler_events else None,
+    }
+    assert all(stages["2"][field] is None for field in _PHASE_KEYS)
+
+
 def test_native_phase_split_with_coalesced_decode_output():
     # A final audio stage folds token-only decode steps into its next emitted
     # output (is_coalesced). The scheduler never holds the output that carries

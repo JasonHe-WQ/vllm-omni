@@ -29,6 +29,7 @@ from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config import SpeculativeConfig as VllmSpeculativeConfig
+from vllm.config.offload import OffloadBackend
 from vllm.config.utils import config
 from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.logger import init_logger
@@ -237,6 +238,11 @@ class _CacheEngineOverrides(TypedDict, total=False):
     mamba_ssm_cache_dtype: str
 
 
+class _OffloadEngineOverrides(TypedDict, total=False):
+    cpu_offload_gb: float
+    offload_backend: OffloadBackend
+
+
 class _SchedulerEngineOverrides(TypedDict, total=False):
     max_num_seqs: int
     max_num_batched_tokens: int
@@ -296,6 +302,7 @@ class _StageEngineValues:
     load: _LoadEngineOverrides
     pooling: _PoolingEngineOverrides
     cache: _CacheEngineOverrides
+    offload: _OffloadEngineOverrides
     scheduler: _SchedulerEngineOverrides
     connector: _ConnectorEngineOverrides
     runtime: _RuntimeEngineOverrides
@@ -475,6 +482,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
 
     model: str | None = None
     model_arch: str | None = None
+    inputs_embeds_size: int | None = Field(default=None, ge=1)
     revision: str | None = None
     tokenizer_revision: str | None = None
     code_revision: str | None = None
@@ -578,6 +586,14 @@ class OmniStageCacheConfig(_TrackExplicitConfigFields, VllmCacheConfig):
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
     # Hybrid-mamba SSM state dtype ("auto"/"float32"); vLLM CacheConfig field.
     mamba_ssm_cache_dtype: str | None = None
+
+
+@config(kw_only=True)
+class OmniStageOffloadConfig:
+    """Per-stage weight offloading inputs; unset values retain vLLM defaults."""
+
+    cpu_offload_gb: float | None = Field(default=None, ge=0.0)
+    offload_backend: OffloadBackend | None = None
 
 
 @_enforce_keyword_only_init
@@ -1267,6 +1283,7 @@ _QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotatio
 _MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
 _LOAD_ENGINE_FIELDS = frozenset(_LoadEngineOverrides.__annotations__)
 _CACHE_ENGINE_FIELDS = frozenset(_CacheEngineOverrides.__annotations__)
+_OFFLOAD_ENGINE_FIELDS = frozenset(_OffloadEngineOverrides.__annotations__)
 _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _POOLING_ENGINE_FIELDS = frozenset(_PoolingEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
@@ -1308,6 +1325,7 @@ _LLM_STAGE_ENGINE_FIELDS = (
     | _LLM_SCHEDULER_ENGINE_FIELDS
     | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS
     | _POOLING_ENGINE_FIELDS
+    | _OFFLOAD_ENGINE_FIELDS
     | {"parallel_config"}
 )
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
@@ -1628,6 +1646,7 @@ def _stage_engine_values(
             _select_engine_overrides(engine, _POOLING_ENGINE_FIELDS),
         ),
         cache=cast(_CacheEngineOverrides, _select_engine_overrides(engine, cache_engine_fields)),
+        offload=cast(_OffloadEngineOverrides, _select_engine_overrides(engine, _OFFLOAD_ENGINE_FIELDS)),
         scheduler=cast(
             _SchedulerEngineOverrides,
             _select_engine_overrides(engine, scheduler_engine_fields),
@@ -1702,6 +1721,7 @@ class BaseVllmOmniStageConfig:
     model_config: OmniStageModelConfig = field(default_factory=OmniStageModelConfig)
     load_config: OmniStageLoadConfig = field(default_factory=OmniStageLoadConfig)
     cache_config: OmniStageCacheConfig = field(default_factory=OmniStageCacheConfig)
+    offload_config: OmniStageOffloadConfig = field(default_factory=OmniStageOffloadConfig)
     scheduler_config: OmniStageSchedulerConfig = field(default_factory=OmniStageSchedulerConfig)
     connector_config: OmniStageConnectorConfig = field(default_factory=OmniStageConnectorConfig)
     pooling_config: OmniStagePoolingConfig = field(default_factory=OmniStagePoolingConfig)
@@ -1868,6 +1888,7 @@ def _build_common_stage_config_kwargs(
                 engine.cache,
                 topology.execution_type,
             ),
+            "offload_config": OmniStageOffloadConfig(**_config_kwargs(engine.offload)),
             "scheduler_config": _build_scheduler_config(
                 deploy,
                 engine.scheduler,
@@ -2053,6 +2074,8 @@ def _build_model_config(
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
     kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
+    if topology.inputs_embeds_size is not None:
+        kwargs["inputs_embeds_size"] = topology.inputs_embeds_size
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
     if "model_arch" not in kwargs:
         kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None
@@ -2452,6 +2475,7 @@ __all__ = [
     "BaseVllmOmniStageConfig",
     "OmniStageLoadConfig",
     "OmniStageModelConfig",
+    "OmniStageOffloadConfig",
     "VllmOmniOrchestratorConfig",
     "OmniStageDiffusionParallelConfig",
     "OmniStageParallelConfig",

@@ -96,6 +96,7 @@ Wiring, in the order the pieces get used
 from __future__ import annotations
 
 import functools
+import logging
 from typing import Any
 
 import torch
@@ -117,6 +118,31 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
 #: Default block size for sliding window on CUDA. Hardware like Ascend NPU may
 #: use larger page sizes (e.g. 128).
 DUPLEX_WINDOW_BLOCK_SIZE = 16
+logger = logging.getLogger(__name__)
+
+
+def _fp8_reanchor_dtype(cache_config) -> torch.dtype | None:
+    """Resolve the scalar FP8 encoding used by the attention backend.
+
+    Per-token/head formats also pack scale metadata into their pages and need
+    a different layout adapter. Refuse them before a session reaches a trim.
+    """
+    cache_dtype = getattr(cache_config, "cache_dtype", "auto") or "auto"
+    if cache_dtype in {"auto", "float16", "bfloat16", "float32"}:
+        return None
+    if cache_dtype not in {"fp8", "fp8_e4m3"}:
+        raise ValueError(
+            "MiniCPM-o duplex KV reanchor supports only unquantized or per-tensor "
+            f"fp8/fp8_e4m3 caches, got {cache_dtype!r}"
+        )
+    # Triton writes/reads its uint8 allocation through this same platform
+    # dtype, rather than treating its byte values as integer key magnitudes.
+    from vllm.platforms import current_platform
+
+    dtype = current_platform.fp8_dtype()
+    if dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        raise ValueError(f"MiniCPM-o duplex KV reanchor does not support platform FP8 dtype {dtype}")
+    return dtype
 
 
 def duplex_window_geometry(
@@ -150,6 +176,7 @@ def validate_duplex_window_install(
     KV-cache profile, so a wrong deploy config fails at startup rather than
     leaving a session that grows without bound.
     """
+    _fp8_reanchor_dtype(cache_config)
     if getattr(cache_config, "enable_prefix_caching", False):
         raise ValueError("MiniCPM-o 4.5 duplex KV window requires enable_prefix_caching=False")
     if geometry.block_size <= 0:
@@ -425,6 +452,7 @@ def rotate_cached_keys(
     plan: PositionReanchor,
     inv_freq: torch.Tensor,
     block_size: int | None = None,
+    fp8_dtype: torch.dtype | None = None,
 ) -> int:
     """Re-RoPE the retained tail where it stands; return the rows touched.
 
@@ -439,9 +467,25 @@ def rotate_cached_keys(
     Uses direct tensor advanced indexing assignment to write rotated keys in-place
     into the underlying storage, preserving V cache, non-retained blocks, and avoiding
     temporary copy allocation on non-contiguous strides.
+
+    Scalar FP8 caches pass the backend's actual ``fp8_dtype``. Their layer K
+    scale is unchanged: for a scalar s, R(q * s) / s == R(q), so rotation can
+    operate on decoded FP8 values in FP32 without reading the scale on host or
+    changing another request's quantization. V and all scale storage stay intact.
     """
     if positions.numel() == 0:
         return 0
+
+    if fp8_dtype is not None:
+        if fp8_dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            raise ValueError(f"unsupported duplex FP8 cache encoding {fp8_dtype}")
+        if k_pool.dtype not in (torch.uint8, fp8_dtype):
+            raise ValueError(f"FP8 reanchor expected uint8/{fp8_dtype} storage, got {k_pool.dtype}")
+        # Byte indexing works for both vLLM's raw uint8 allocation and an FP8
+        # view. This aliases storage; graph-bound KV addresses never change.
+        k_pool = k_pool.view(torch.uint8)
+    elif k_pool.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise ValueError("quantized duplex KV reanchor requires an explicit supported FP8 encoding")
 
     if k_pool.dim() == 5:
         if k_pool.shape[0] == 2:
@@ -491,13 +535,24 @@ def rotate_cached_keys(
     h_idx = torch.arange(num_kv_heads, device=k_pool.device).unsqueeze(0)
     o_idx = offsets.unsqueeze(1)
 
+    def rotate_stored_keys(keys: torch.Tensor) -> torch.Tensor:
+        if fp8_dtype is None:
+            return rotate_keys(keys, plan.delta, inv_freq)
+        decoded = keys.view(fp8_dtype).to(torch.float32)
+        rotated = rotate_keys(decoded, plan.delta, inv_freq)
+        # A rotation may increase a component beyond the original FP8 range.
+        # Saturate with the existing scale instead of creating NaNs or changing
+        # the shared layer scale while other requests retain unrotated keys.
+        limit = torch.finfo(fp8_dtype).max
+        return rotated.clamp(-limit, limit).to(fp8_dtype).view(torch.uint8)
+
     if layout == "BHND":
         keys = k_pool[b_idx, h_idx, o_idx, :expected_head_dim]
-        rotated = rotate_keys(keys, plan.delta, inv_freq)
+        rotated = rotate_stored_keys(keys)
         k_pool[b_idx, h_idx, o_idx, :expected_head_dim] = rotated
     else:
         keys = k_pool[b_idx, o_idx, h_idx, :expected_head_dim]
-        rotated = rotate_keys(keys, plan.delta, inv_freq)
+        rotated = rotate_stored_keys(keys)
         k_pool[b_idx, o_idx, h_idx, :expected_head_dim] = rotated
 
     return int(positions.numel())
@@ -841,9 +896,11 @@ class MiniCPMO45DuplexWorkerHelper:
             duplex = info.get("duplex")
             if not isinstance(duplex, dict):
                 continue
-            reanchor = duplex.pop("stage0_reanchor", None)
+            reanchor = duplex.get("stage0_reanchor")
             if reanchor is None:
                 continue
+            fp8_dtype = _fp8_reanchor_dtype(getattr(runner, "cache_config", None))
+            duplex.pop("stage0_reanchor")
 
             # Sanitize scheduled_new_reqs in scheduler_output so subsequent runner
             # metadata refreshes (_update_additional_information in _preprocess)
@@ -922,6 +979,16 @@ class MiniCPMO45DuplexWorkerHelper:
                         plan=plan,
                         inv_freq=inv_freq,
                         block_size=block_size,
+                        fp8_dtype=fp8_dtype,
+                    )
+                if fp8_dtype is not None:
+                    logger.info(
+                        "MiniCPM-o duplex FP8 KV reanchor: request_id=%s dtype=%s delta=%d layers=%d rows_per_layer=%d",
+                        req_id,
+                        fp8_dtype,
+                        plan.delta,
+                        len(runner.kv_caches),
+                        positions.numel(),
                     )
 
             # Evict worker-held unit history so state.window_units remains bounded

@@ -104,6 +104,9 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MiniCPMO45Code2Wav",
+            # embed_input_ids returns an unused Nx1 placeholder. The generic
+            # runner must not allocate Nx4096 from the Thinker's HF config.
+            inputs_embeds_size=1,
             supports_native_mrv2_data_plane=True,
             supports_duplex_mrv2=True,
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",

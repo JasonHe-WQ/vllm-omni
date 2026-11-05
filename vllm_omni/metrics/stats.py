@@ -227,6 +227,8 @@ def _apply_merged_stage_stats(template: StageRequestStats, merged: dict[str, obj
     stats.vllm_tpot_ms = _as_float(merged.get(defs.VLLM_TPOT_MS))
     stats.vllm_itls_ms = _as_float_list(merged.get(defs.VLLM_ITLS_MS))
     stats.vllm_itl_ms = _as_float(merged.get(defs.VLLM_ITL_MS))
+    for field in _PHASE_SPLIT_FIELDS:
+        setattr(stats, field, merged.get(field))
     return stats
 
 
@@ -249,14 +251,6 @@ def _one_row_per_stage(events: list[StageRequestStats]) -> list[StageRequestStat
         if tpot_ms is not None:
             merged[defs.VLLM_TPOT_MS] = tpot_ms
         row = _apply_merged_stage_stats(templates[sid], merged)
-        # Only the chunk that finished an engine-core request carries its phase
-        # split, and the template (first chunk) usually does not. Copy the split
-        # of the last chunk that has one, without mixing fields across chunks.
-        for chunk in reversed(chunks_by_stage[sid]):
-            if any(getattr(chunk, field) is not None for field in _PHASE_SPLIT_FIELDS):
-                for field in _PHASE_SPLIT_FIELDS:
-                    setattr(row, field, getattr(chunk, field))
-                break
         rows.append(row)
     return rows
 
@@ -629,6 +623,7 @@ class OrchestratorAggregator:
                     defs.VLLM_ITLS_MS: list(evt.vllm_itls_ms or []),
                 }
             )
+            current.update({field: getattr(evt, field) for field in _PHASE_SPLIT_FIELDS})
             return current
 
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
@@ -686,6 +681,13 @@ class OrchestratorAggregator:
         vllm_itls.extend(list(evt.vllm_itls_ms or []))
         current[defs.VLLM_ITLS_MS] = vllm_itls
         current[defs.VLLM_ITL_MS] = sum(vllm_itls) / float(len(vllm_itls)) if vllm_itls else 0.0
+
+        # Only a finished engine-core request carries the phase split. Keep
+        # its complete group for both SSE snapshots and log tables, preserving
+        # measured zeros and never filling missing fields from an older group.
+        phase_split = {field: getattr(evt, field) for field in _PHASE_SPLIT_FIELDS}
+        if any(value is not None for value in phase_split.values()):
+            current.update(phase_split)
 
         output_count = int(current.get(defs.OUTPUT_UNIT_COUNT, 0))
         remaining_ms = max(

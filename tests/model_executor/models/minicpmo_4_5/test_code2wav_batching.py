@@ -4,6 +4,7 @@
 import gc
 import subprocess
 import sys
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -115,6 +116,20 @@ class _FakeDecoder(nn.Module):
         self.estimator = _FakeEstimator()
         self.inference_cfg_rate = 0.7
         self.register_buffer("rand_noise", torch.zeros(1, 1, 100), persistent=False)
+
+
+class _HistoryEstimator(_FakeEstimator):
+    """Make future outputs depend on the exact retained attention frames."""
+
+    def blocks_forward_chunk(self, inputs, time, mask, cnn_cache, att_cache, cnn_out, att_out):
+        del time, mask, cnn_cache
+        current = torch.stack((inputs[:, 1], inputs[:, 2]), dim=-1).unsqueeze(1)
+        prior = att_cache[0] if isinstance(att_cache, torch.Tensor) else None
+        combined = torch.cat((current, prior), dim=-2) if prior is not None else current
+        att_out[0].copy_(combined)
+        cnn_out.copy_(inputs[:, 1, 0].reshape(1, -1, 1, 1).expand_as(cnn_out))
+        history = 0.0 if prior is None else prior.mean(dim=(1, 2, 3)).reshape(-1, 1, 1)
+        return inputs[:, 1:2] * 0.1 + history * 0.01
 
 
 class _FakeFlow(nn.Module):
@@ -358,6 +373,316 @@ def test_setup_cache_reuses_read_only_state_for_the_same_exact_batch():
     for name, expected in snapshots.items():
         cache = first[0].flow_cache if name in first[0].flow_cache else first[0].hift_cache
         torch.testing.assert_close(cache[name], expected)
+
+
+def test_batched_decode_owns_its_attention_caches_after_upstream_buffers_are_dropped():
+    pytest.importorskip("s3tokenizer")
+    pytest.importorskip("onnxruntime")
+    pytest.importorskip("hyperpyyaml")
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import (
+        drop_upstream_chunk_att_buffers,
+    )
+
+    outputs = []
+    for drop_buffers in (False, True):
+        token2wav = _FakeToken2Wav()
+        decoder = token2wav.flow.decoder
+        decoder.register_buffer("att_cache_buffer", torch.ones(2, 3, 4), persistent=False)
+        cnn_buffer = decoder.estimator.cnn_cache_buffer
+        noise = decoder.rand_noise
+        if drop_buffers:
+            released = drop_upstream_chunk_att_buffers(token2wav.flow)
+            assert released == (24 + 1) * torch.empty((), dtype=torch.float32).element_size()
+            assert not hasattr(decoder, "att_cache_buffer")
+            assert not hasattr(decoder.estimator, "att_cache_buffer")
+            assert decoder.estimator.cnn_cache_buffer is cnn_buffer
+            assert decoder.rand_noise is noise
+
+        adapter = BatchedToken2Wav(token2wav)
+        prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+        states = adapter.setup_batch(prompt, 1)
+        chunks = []
+        for ids, last_chunk in (([10, 11], False), ([12, 13], True)):
+            audios, states = adapter.decode_batch(torch.tensor([ids]), prompt, states, last_chunk=last_chunk)
+            chunks.extend(audios)
+        outputs.append((chunks, states[0].flow_cache, states[0].hift_cache))
+
+    # Removing the legacy workspace must not change prompt setup, continuation
+    # state, or final audio: all of these use the batched backend's own caches.
+    torch.testing.assert_close(outputs[0], outputs[1])
+
+
+@pytest.mark.parametrize("execution", ["eager", "graph", "trt"])
+def test_single_request_attention_stack_borrows_only_for_eager(execution):
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+    original = states[0].flow_cache["estimator_att_cache"]
+    if execution == "graph":
+        adapter._cfm_graph_enabled = True
+    elif execution == "trt":
+        adapter._trt_stepper = object()
+    stacked = adapter._stack_flow_cache(states)["estimator_att_cache"]
+    torch.testing.assert_close(stacked, original, rtol=0, atol=0)
+    assert (stacked is original) == (execution == "eager")
+
+
+def test_multiple_request_attention_stack_keeps_cfg_order():
+    first = torch.tensor([1.0, 2.0]).reshape(1, 1, 2, 1, 1, 1)
+    second = torch.tensor([3.0, 4.0]).reshape(1, 1, 2, 1, 1, 1)
+    stacked = BatchedToken2Wav._stack_estimator_att([first, second], borrow_single=True)
+    assert stacked.flatten().tolist() == [1.0, 3.0, 2.0, 4.0]
+    assert stacked.data_ptr() not in {first.data_ptr(), second.data_ptr()}
+
+
+def test_decode_releases_stacked_inputs_before_split_and_outputs_before_hift(monkeypatch):
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 2)
+    refs = {}
+    original_stack = adapter._stack_flow_cache
+    original_split = adapter._split_flow_cache
+    original_hift = adapter._hift_inference
+
+    def stack(*args, **kwargs):
+        result = original_stack(*args, **kwargs)
+        refs["old_attention"] = weakref.ref(result["estimator_att_cache"])
+        return result
+
+    def split(cache, *args, **kwargs):
+        assert refs["old_attention"]() is None
+        refs["new_attention"] = weakref.ref(cache["estimator_att_cache"])
+        return original_split(cache, *args, **kwargs)
+
+    def hift(*args, **kwargs):
+        assert refs["new_attention"]() is None
+        return original_hift(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_stack_flow_cache", stack)
+    monkeypatch.setattr(adapter, "_split_flow_cache", split)
+    monkeypatch.setattr(adapter, "_hift_inference", hift)
+    audios, next_states = adapter.decode_batch(torch.tensor([[10, 11], [12, 13]]), prompt, states, last_chunk=False)
+    assert len(audios) == len(next_states) == 2
+
+
+def _history_adapter():
+    token2wav = _FakeToken2Wav()
+    token2wav.flow.decoder.estimator = _HistoryEstimator()
+    token2wav.flow.decoder.rand_noise = torch.zeros(1, 1, 2048)
+    return BatchedToken2Wav(token2wav)
+
+
+@pytest.mark.parametrize(
+    "old_frames,new_frames,keep", [(300, 50, (300, 100)), (400, 14, (300, 100)), (400, 50, (300, 100))]
+)
+def test_eager_attention_handoff_matches_trimmed_legacy_storage(old_frames, new_frames, keep):
+    adapter = _history_adapter()
+    old = torch.arange(2 * 2 * old_frames * 2, dtype=torch.float32).reshape(2, 1, 2, 1, old_frames, 2) / 1000
+    old_copy = old.clone()
+    mu, speaker, cond = torch.ones(1, 1, new_frames), torch.ones(1, 1), torch.zeros(1, 1, new_frames)
+    kwargs = dict(cnn_cache=None, att_cache=old, att_keep=keep)
+    legacy = adapter._decode_cfm(mu, speaker, cond, **kwargs)
+    optimized = adapter._decode_cfm(mu, speaker, cond, **kwargs, allow_eager_att_handoff=True)
+    assert isinstance(legacy[2], torch.Tensor)
+    assert isinstance(optimized[2], list) and len(optimized[2]) == 1
+    expected = legacy[2]
+    if old_frames + new_frames > sum(keep):
+        expected = torch.cat((expected[..., : keep[0], :], expected[..., -keep[1] :, :]), dim=-2)
+    actual = optimized[2][0]
+    torch.testing.assert_close(optimized[:2], legacy[:2], rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(old, old_copy, rtol=0, atol=0)
+    assert actual.shape[-2] == min(old_frames + new_frames, sum(keep))
+    assert actual.untyped_storage().nbytes() == actual.numel() * actual.element_size()
+    assert actual.data_ptr() != old.data_ptr()
+
+
+def test_eager_handoff_is_exact_across_chunks_and_keeps_shared_prompt_base(monkeypatch):
+    legacy, optimized = _history_adapter(), _history_adapter()
+    original_legacy_solve = legacy._decode_cfm
+
+    def legacy_solve(*args, **kwargs):
+        kwargs["allow_eager_att_handoff"] = False
+        return original_legacy_solve(*args, **kwargs)
+
+    monkeypatch.setattr(legacy, "_decode_cfm", legacy_solve)
+    prompt = batched_token2wav_module.PromptFeatures(
+        cache_key=("reference", "/fake.wav"),
+        speech_tokens=torch.arange(298).reshape(1, -1),
+        speaker_embedding=torch.ones(1, 1),
+        mels=torch.ones(1, 300, 1),
+    )
+    original_split = optimized._split_flow_cache
+    handoffs = []
+
+    def split(cache, *args, **kwargs):
+        assert isinstance(cache["estimator_att_cache"], list)
+        result = original_split(cache, *args, **kwargs)
+        assert result[0]["estimator_att_cache"] is cache["estimator_att_cache"][0]
+        handoffs.append(result[0]["estimator_att_cache"].shape[-2])
+        return result
+
+    monkeypatch.setattr(optimized, "_split_flow_cache", split)
+    old_states = legacy.setup_batch(prompt, 1)
+    new_states = optimized.setup_batch(prompt, 1)
+    shared = optimized.setup_batch(prompt, 2)
+    assert shared[0] is shared[1] is new_states[0]
+    shared_snapshots = {key: value.clone() for key, value in shared[0].flow_cache.items()}
+    for index, width in enumerate((51, 51, 15, 51)):
+        tokens = torch.arange(width).reshape(1, -1) + index + 10
+        old_audio, old_states = legacy.decode_batch(tokens, prompt, old_states, last_chunk=index == 3)
+        new_audio, new_states = optimized.decode_batch(tokens, prompt, new_states, last_chunk=index == 3)
+        torch.testing.assert_close(new_audio, old_audio, rtol=0, atol=0)
+        torch.testing.assert_close(new_states[0].flow_cache, old_states[0].flow_cache, rtol=0, atol=0)
+        torch.testing.assert_close(new_states[0].hift_cache, old_states[0].hift_cache, rtol=0, atol=0)
+        for key, snapshot in shared_snapshots.items():
+            torch.testing.assert_close(shared[0].flow_cache[key], snapshot, rtol=0, atol=0)
+        assert (
+            new_states[0].flow_cache["estimator_att_cache"].data_ptr()
+            != shared[0].flow_cache["estimator_att_cache"].data_ptr()
+        )
+    assert handoffs == [300, 350, 400, 400, 400]
+
+
+@pytest.mark.parametrize("mode", ["disabled", "batch2", "graph_flag", "whole_wrapper", "trt", "ragged"])
+def test_eager_attention_handoff_is_strictly_gated(mode, monkeypatch):
+    adapter = _history_adapter()
+    batch = 2 if mode == "batch2" else 1
+    if mode == "graph_flag":
+        adapter._cfm_graph_enabled = True
+    elif mode == "whole_wrapper":
+        adapter._whole_euler_graph_wrapper = SimpleNamespace(enabled=False)
+    elif mode == "trt":
+
+        def step(**kwargs):
+            x = kwargs["x"]
+            return (x, x.new_zeros((1, x.shape[0], 2, 1)), x.new_zeros((1, x.shape[0], 1, x.shape[2], 2)))
+
+        adapter._trt_stepper = SimpleNamespace(step=step)
+    kwargs = {}
+    if mode == "ragged":
+        _enable_fake_ragged_kernel(adapter)
+        kwargs["valid_lengths"] = [2]
+    output = adapter._decode_cfm(
+        torch.ones(batch, 1, 2),
+        torch.ones(batch, 1),
+        torch.zeros(batch, 1, 2),
+        cnn_cache=None,
+        att_cache=None,
+        att_keep=(1, 1),
+        allow_eager_att_handoff=mode != "disabled",
+        **kwargs,
+    )
+    # Ragged already has its own list/ownership contract; it remains untrimmed.
+    if mode == "ragged":
+        assert isinstance(output[2], list) and output[2][0].shape[-2] == 2
+    else:
+        assert isinstance(output[2], torch.Tensor)
+
+
+def test_step_graph_borrowed_attention_output_is_still_copied(monkeypatch):
+    adapter = _history_adapter()
+
+    class BorrowedGraph:
+        enabled = False
+
+        def replay(self, inputs, time, cnn, att, cnn_out, att_out, mask):
+            del time, cnn, att, mask
+            if not hasattr(self, "storage"):
+                self.storage = torch.ones_like(att_out)
+            else:
+                self.storage.add_(1)
+            return inputs[:, :1], cnn_out.zero_(), self.storage
+
+    graph = BorrowedGraph()
+    adapter._cfm_graph_wrapper = graph
+    output = adapter._decode_cfm(
+        torch.ones(1, 1, 3),
+        torch.ones(1, 1),
+        torch.zeros(1, 1, 3),
+        cnn_cache=None,
+        att_cache=None,
+        att_keep=(1, 1),
+        allow_eager_att_handoff=True,
+    )
+    assert isinstance(output[2], torch.Tensor)
+    snapshot = output[2].clone()
+    graph.storage.zero_()
+    torch.testing.assert_close(output[2], snapshot, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("setup_cache_size", [0, 1])
+@pytest.mark.parametrize("whole_euler_fallback", [False, True])
+def test_setup_adopts_owned_attention_with_step_graph_and_preserves_shared_base(
+    monkeypatch, setup_cache_size, whole_euler_fallback
+):
+    adapter = _history_adapter()
+    adapter._setup_cache_size = setup_cache_size
+
+    class BorrowedGraph:
+        enabled = True
+
+        def replay(self, inputs, time, cnn, att, cnn_out, att_out, mask):
+            # Deliberately return reused graph storage. _decode_cfm must keep
+            # copying each step before setup can take ownership of its result.
+            if not hasattr(self, "storage") or self.storage.shape != att_out.shape:
+                self.storage = torch.empty_like(att_out)
+            out = adapter.flow.decoder.estimator.blocks_forward_chunk(
+                inputs, time, mask, cnn, att, cnn_out, self.storage
+            )
+            return out, cnn_out, self.storage
+
+    graph = BorrowedGraph()
+    adapter._cfm_graph_enabled = True
+    adapter._cfm_graph_wrapper = graph
+    whole_replay = Mock(return_value=None)
+    adapter._whole_euler_graph_wrapper = SimpleNamespace(
+        enabled=whole_euler_fallback, replay=whole_replay, ragged_body=None
+    )
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    solved = []
+    original_solve = adapter._decode_cfm
+
+    def solve(*args, **kwargs):
+        result = original_solve(*args, **kwargs)
+        solved.append(result[2])
+        return result
+
+    monkeypatch.setattr(adapter, "_decode_cfm", solve)
+    states = adapter.setup_batch(prompt, 2)
+    assert len(solved) == 1 and isinstance(solved[0], torch.Tensor)
+    assert whole_replay.call_count == int(whole_euler_fallback)
+    assert states[0] is states[1]
+    cache = states[0].flow_cache["estimator_att_cache"]
+    assert cache is solved[0]
+    snapshot = cache.clone()
+    graph.storage.zero_()
+    torch.testing.assert_close(cache, snapshot, rtol=0, atol=0)
+    adapter.decode_batch(torch.tensor([[10, 11, 12]]), prompt, states[:1], last_chunk=False)
+    torch.testing.assert_close(cache, snapshot, rtol=0, atol=0)
+    if setup_cache_size:
+        assert adapter.setup_batch(prompt, 1)[0] is states[0]
+
+
+@pytest.mark.parametrize("batch_size,cache_dtype", [(2, torch.float32), (1, torch.bfloat16)])
+def test_setup_keeps_split_and_dtype_conversion_when_direct_adoption_is_inapplicable(
+    monkeypatch, batch_size, cache_dtype
+):
+    adapter = _history_adapter()
+    adapter._estimator_att_cache_dtype = cache_dtype
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    owned = torch.arange(2 * batch_size * 4, dtype=torch.float32).reshape(1, 1, 2 * batch_size, 1, 4, 1)
+
+    def solve(*args, **kwargs):
+        return torch.zeros(batch_size, 1, 4), torch.zeros(1, 1, 2 * batch_size, 2, 1), owned
+
+    monkeypatch.setattr(adapter, "_decode_cfm", solve)
+    states = adapter._create_initial_states(prompt, batch_size)
+    for row, state in enumerate(states):
+        cache = state.flow_cache["estimator_att_cache"]
+        expected = torch.cat((owned[:, :, row : row + 1], owned[:, :, batch_size + row : batch_size + row + 1]), dim=2)
+        torch.testing.assert_close(cache, expected.to(cache_dtype))
+        assert cache.data_ptr() != owned.data_ptr()
 
 
 def test_setup_solves_the_prompt_once_for_every_batch_size():

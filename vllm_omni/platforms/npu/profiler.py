@@ -45,7 +45,7 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
         for activity in activities:
             if activity == "CPU":
                 npu_activities.append(torch_npu.profiler.ProfilerActivity.CPU)
-            elif activity == "NPU":
+            elif activity in ("NPU", "PrivateUse1"):
                 npu_activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
         # NPU-specific experimental config for detailed profiling

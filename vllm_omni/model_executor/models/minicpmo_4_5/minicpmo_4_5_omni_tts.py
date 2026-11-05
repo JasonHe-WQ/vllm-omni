@@ -862,6 +862,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             vllm_config=talker_config,
             prefix=maybe_prefix(prefix, "tts_obj.model"),
         )
+        # Prefill uses emb_text + projector_semantic, decode uses emb_code.
+        # The backbone always receives inputs_embeds, so its 32k token table
+        # is unused. Remove it before loading the checkpoint.
+        self.tts_model.embed_tokens = None
         self.emb_text = nn.Embedding(int(cfg.num_text_tokens), int(cfg.hidden_size))
         self.projector_semantic = _MiniCPMTTSProjector(int(cfg.llm_dim), int(cfg.hidden_size))
         self.emb_code = nn.ModuleList(
@@ -2832,6 +2836,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if not name.startswith("tts."):
                 continue
             stripped = name[len("tts.") :]
+            if stripped.startswith("model.embed_tokens."):
+                continue
             if stripped.startswith("model."):
                 backbone_weights.append((stripped[len("model.") :], tensor))
                 continue

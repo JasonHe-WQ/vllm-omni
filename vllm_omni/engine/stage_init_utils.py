@@ -1184,6 +1184,7 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_omni_config_fields(config, field_map=field_map))
     else:
+        engine_args.update(_project_omni_config_fields(stage_config.offload_config))
         for config, field_map in (
             (stage_config.load_config, _LOAD_STAGE_ENGINE_FIELD_MAP),
             (stage_config.cache_config, _CACHE_STAGE_ENGINE_FIELD_MAP),

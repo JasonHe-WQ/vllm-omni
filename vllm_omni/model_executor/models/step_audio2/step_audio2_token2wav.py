@@ -3,8 +3,10 @@
 
 import io
 import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any
 
 import numpy as np
@@ -34,12 +36,14 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.step_audio2.eager_scratch import enable_dynamic_chunk_scratch
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_STREAM_CONFIG,
     DEFAULT_TOKEN2WAV_CONFIG,
     STEP_AUDIO2_DEFAULT_PROMPT_WAV,
     STREAM_SOURCE_CACHE_LEN,
 )
+from vllm_omni.utils.torch_compile import _undecorate_dynamo
 
 logger = init_logger(__name__)
 
@@ -80,6 +84,9 @@ class _StreamState:
     stream_cache: dict | None = None
     hift_cache_dict: dict = field(default_factory=dict)
     finished: bool = False
+    prompt_features: tuple[torch.Tensor, ...] | None = None
+    prompt_wav: str | None = None
+    config_signature: tuple | None = None
 
 
 class _ConvRNNF0Predictor(nn.Module):
@@ -132,6 +139,9 @@ class StepAudio2Token2WavCore(nn.Module):
         device: str = "cuda",
         n_timesteps: int = DEFAULT_TOKEN2WAV_CONFIG.n_timesteps,
         drop_upstream_chunk_att_buffers: bool = False,
+        prompt_cache_size: int = 4,
+        setup_cache_size: int = 1,
+        audio_tokenizer_device: str | torch.device | None = None,
     ):
         super().__init__()
         self.model_path = model_path
@@ -140,6 +150,9 @@ class StepAudio2Token2WavCore(nn.Module):
         self._drop_chunk_att_buffers = bool(drop_upstream_chunk_att_buffers)
         self.float16 = float16
         self.device = torch.device(device)
+        # Reference tokenization runs once per uncached voice. It may stay on
+        # CPU independently of the flow/HiFT modules used for every chunk.
+        self.audio_tokenizer_device = torch.device(audio_tokenizer_device or self.device)
         self.n_timesteps = n_timesteps
 
         self._models_loaded = False
@@ -148,7 +161,15 @@ class StepAudio2Token2WavCore(nn.Module):
         self._flow = None
         self._hift = None
 
-        self.cache = {}
+        if prompt_cache_size < 0 or setup_cache_size < 0:
+            raise ValueError("Token2Wav prompt/setup cache capacities must be >= 0")
+        self.prompt_cache_size = prompt_cache_size
+        self.setup_cache_size = setup_cache_size
+        self.cache: OrderedDict[str, tuple[torch.Tensor, ...]] = OrderedDict()
+        self._prompt_versions: dict[str, tuple[int, ...] | None] = {}
+        self._setup_cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
+        self._cache_config: tuple | None = None
+        self._cache_lock = RLock()
 
         # Streaming state (constants from centralised config)
         self.mel_cache_len = DEFAULT_STREAM_CONFIG.mel_cache_len
@@ -182,17 +203,21 @@ class StepAudio2Token2WavCore(nn.Module):
         logger = init_logger(__name__)
         logger.info(f"Loading Token2Wav models from: {self.model_path}")
 
-        self._audio_tokenizer = (
-            s3tokenizer.load_model(f"{self.model_path}/speech_tokenizer_v2_25hz.onnx").to(self.device).eval()
-        )
+        # Do not inherit a caller's CUDA default-device context when the
+        # reference tokenizer was explicitly placed on CPU.
+        with torch.device("cpu"):
+            audio_tokenizer = s3tokenizer.load_model(f"{self.model_path}/speech_tokenizer_v2_25hz.onnx")
+        self._audio_tokenizer = audio_tokenizer.to(self.audio_tokenizer_device).eval()
 
         with open(f"{self.model_path}/flow.yaml") as f:
             configs = load_hyperpyyaml(f)
         self._flow = configs["flow"]
+        _undecorate_dynamo(self._flow.encoder, "forward_chunk")
         if self._drop_chunk_att_buffers:
             # Before ``.to(self.device)``: the buffers never reach the device.
             released = drop_upstream_chunk_att_buffers(self._flow)
             logger.info("Dropped the upstream flow chunk attention buffers (%.1f MiB)", released / 2**20)
+        enable_dynamic_chunk_scratch(self._flow)
         if self.float16:
             self._flow.half()
         self._flow.load_state_dict(
@@ -210,6 +235,65 @@ class StepAudio2Token2WavCore(nn.Module):
 
         self._models_loaded = True
         logger.info("Token2Wav models loaded successfully")
+
+    def _inference_config_signature(self) -> tuple:
+        parameter = next(self.flow.parameters(), None)
+        return (
+            self.model_path,
+            self.device,
+            self.audio_tokenizer_device,
+            self.float16,
+            self.n_timesteps,
+            id(self.flow),
+            id(self._spk_model),
+            None if parameter is None else (parameter.device, parameter.dtype),
+            getattr(self.flow, "up_rate", DEFAULT_STREAM_CONFIG.up_rate),
+            getattr(self.flow.decoder, "inference_cfg_rate", None),
+            DEFAULT_STREAM_CONFIG.pre_lookahead_len,
+            self.mel_cache_len,
+            self.source_cache_len,
+        )
+
+    def _get_prompt(self, prompt_wav: str) -> tuple[torch.Tensor, ...]:
+        with self._cache_lock:
+            return self._get_prompt_locked(prompt_wav)
+
+    def _get_prompt_locked(self, prompt_wav: str) -> tuple[torch.Tensor, ...]:
+        """Cache reference features and invalidate derived setup on changes."""
+        self._ensure_models_loaded()
+        config = self._inference_config_signature()
+        if config != self._cache_config:
+            self.cache.clear()
+            self._prompt_versions.clear()
+            self._setup_cache.clear()
+            self._cache_config = config
+        try:
+            stat = os.stat(prompt_wav)
+            version = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        except FileNotFoundError:
+            # load_audio also accepts URLs; their lifetime is bounded by LRU.
+            version = None
+        if prompt_wav in self.cache and self._prompt_versions[prompt_wav] != version:
+            self.cache.pop(prompt_wav)
+            self._prompt_versions.pop(prompt_wav)
+            self._setup_cache.pop(prompt_wav, None)
+        features = self.cache.get(prompt_wav)
+        if features is None:
+            features = self._prepare_prompt(prompt_wav)
+            # Speaker extraction can lazily construct the speaker model.
+            self._cache_config = self._inference_config_signature()
+            if self.prompt_cache_size > 0:
+                self.cache[prompt_wav] = features
+                self._prompt_versions[prompt_wav] = version
+        else:
+            self.cache.move_to_end(prompt_wav)
+        while len(self.cache) > self.prompt_cache_size:
+            evicted, _ = self.cache.popitem(last=False)
+            self._prompt_versions.pop(evicted)
+            self._setup_cache.pop(evicted, None)
+        while len(self._setup_cache) > self.setup_cache_size:
+            self._setup_cache.popitem(last=False)
+        return features
 
     @property
     def audio_tokenizer(self):
@@ -305,8 +389,10 @@ class StepAudio2Token2WavCore(nn.Module):
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
         prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
-            mels.to(self.device), mels_lens.to(self.device)
+            mels.to(self.audio_tokenizer_device), mels_lens.to(self.audio_tokenizer_device)
         )
+        prompt_speech_tokens = prompt_speech_tokens.to(self.device)
+        prompt_speech_tokens_lens = prompt_speech_tokens_lens.to(self.device)
 
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
@@ -355,9 +441,9 @@ class StepAudio2Token2WavCore(nn.Module):
         Returns:
             Audio waveform as bytes or tensor
         """
-        if prompt_wav not in self.cache:
-            self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
-        prompt_speech_tokens, prompt_speech_tokens_lens, spk_emb, prompt_mels, prompt_mels_lens = self.cache[prompt_wav]
+        prompt_speech_tokens, prompt_speech_tokens_lens, spk_emb, prompt_mels, prompt_mels_lens = self._get_prompt(
+            prompt_wav
+        )
 
         generated_speech_tokens = torch.tensor([generated_speech_tokens], dtype=torch.int32, device=self.device)
         generated_speech_tokens_lens = torch.tensor(
@@ -390,25 +476,48 @@ class StepAudio2Token2WavCore(nn.Module):
     # ------------------------------------------------------------------
 
     def setup_stream_for(self, prompt_wav: str, state: _StreamState) -> None:
-        """Initialise flow + HiFT caches into *state* (no self mutation)."""
-        if prompt_wav not in self.cache:
-            self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
-        prompt_speech_tokens, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
+        """Reuse reference setup, giving every request independent work tensors."""
+        with self._cache_lock:
+            self._setup_stream_for_locked(prompt_wav, state)
 
-        if self.speech_window is None or self.speech_window.device != self.device:
+    def _setup_stream_for_locked(self, prompt_wav: str, state: _StreamState) -> None:
+        features = self._get_prompt_locked(prompt_wav)
+        prompt_speech_tokens, _, spk_emb, prompt_mels, _ = features
+
+        if (
+            self.speech_window is None
+            or self.speech_window.device != self.device
+            or self.speech_window.numel() != 2 * self.source_cache_len
+        ):
             self.speech_window = torch.from_numpy(np.hamming(2 * self.source_cache_len)).to(
                 device=self.device, dtype=torch.float32
             )
 
         pre_lookahead = DEFAULT_STREAM_CONFIG.pre_lookahead_len
-        state.stream_cache = self.flow.setup_cache(
-            torch.cat(
-                [prompt_speech_tokens, prompt_speech_tokens[:, :pre_lookahead]],
-                dim=1,
-            ),
-            prompt_mels,
-            spk_emb,
-            n_timesteps=self.n_timesteps,
+        base = self._setup_cache.get(prompt_wav)
+        if base is None:
+            with torch.amp.autocast(self.device.type, enabled=self.float16, dtype=torch.float16):
+                prepared = self.flow.setup_cache(
+                    torch.cat(
+                        [prompt_speech_tokens, prompt_speech_tokens[:, :pre_lookahead]],
+                        dim=1,
+                    ),
+                    prompt_mels,
+                    spk_emb,
+                    n_timesteps=self.n_timesteps,
+                )
+            # Upstream may return views of its reusable workspaces. Keep the
+            # saved reference independent from both those and request writes.
+            base = {name: tensor.detach().clone() for name, tensor in prepared.items()}
+            del prepared
+            if self.setup_cache_size > 0 and prompt_wav in self.cache:
+                self._setup_cache[prompt_wav] = base
+                while len(self._setup_cache) > self.setup_cache_size:
+                    self._setup_cache.popitem(last=False)
+        else:
+            self._setup_cache.move_to_end(prompt_wav)
+        state.stream_cache = (
+            {name: tensor.clone() for name, tensor in base.items()} if prompt_wav in self._setup_cache else base
         )
         state.hift_cache_dict = {
             "mel": torch.zeros(1, prompt_mels.shape[2], 0, device=self.device),
@@ -416,6 +525,10 @@ class StepAudio2Token2WavCore(nn.Module):
             "speech": torch.zeros(1, 0, device=self.device),
         }
         state.setup_done = True
+        state.finished = False
+        state.prompt_features = features
+        state.prompt_wav = prompt_wav
+        state.config_signature = self._inference_config_signature()
 
     def stream_chunk_for(
         self,
@@ -428,9 +541,15 @@ class StepAudio2Token2WavCore(nn.Module):
         if state.stream_cache is None:
             raise ValueError("stream_cache not initialised – call setup_stream_for() first")
 
-        if prompt_wav not in self.cache:
-            self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
-        _, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
+        if state.config_signature != self._inference_config_signature():
+            raise RuntimeError(
+                "Token2Wav configuration changed during an active stream; reset and set up the stream again"
+            )
+        if state.prompt_features is None:
+            raise ValueError("prompt conditioning not initialised - call setup_stream_for() first")
+        if prompt_wav != state.prompt_wav:
+            raise ValueError("Token2Wav reference changed during an active stream; reset and set up the stream again")
+        _, _, spk_emb, prompt_mels, _ = state.prompt_features
 
         if isinstance(audio_tokens, torch.Tensor):
             # Already on device; avoids the D2H->H2D round-trip of rebuilding from a list.
@@ -494,6 +613,9 @@ class StepAudio2Token2WavCore(nn.Module):
         state.hift_cache_dict = {}
         state.setup_done = False
         state.finished = True
+        state.prompt_features = None
+        state.prompt_wav = None
+        state.config_signature = None
 
 
 class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
@@ -526,7 +648,13 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         if hasattr(vllm_config, "device_config") and vllm_config.device_config:
             device = str(vllm_config.device_config.device)
 
-        self.token2wav = StepAudio2Token2WavCore(model_path=model_path, float16=float16, device=device)
+        self.token2wav = StepAudio2Token2WavCore(
+            model_path=model_path,
+            float16=float16,
+            device=device,
+            prompt_cache_size=getattr(self.config, "token2wav_prompt_cache_size", 4),
+            setup_cache_size=getattr(self.config, "token2wav_setup_cache_size", 1),
+        )
 
         # Match the MiniCPM-o wiring: on NPU run the campplus speaker embedding
         # on device (torch, weights from the same campplus.onnx) instead of the

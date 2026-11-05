@@ -1035,7 +1035,22 @@ def llm2tts(
         tts_token_ids_slice = tts_hidden_slice = None
         native_segment_end = False
         if not is_native_duplex_handoff:
-            if tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
+            empty_speech = (
+                bool(llm_output_ids)
+                and not thinker_text.strip()
+                and (
+                    all(token_id in tts_end_ids for token_id in llm_output_ids)
+                    or (tts_bos_idx is not None and tts_bos_idx >= prompt_token_ids_len and tts_eos_idx == tts_bos_idx)
+                )
+            )
+            if empty_speech:
+                # A first-token EOS has no generated hidden row: only the
+                # prompt was forwarded. Send the explicit empty condition so
+                # the Talker takes its existing no-audio path with two safe
+                # placeholder slots, never the text EOS in its codec table.
+                tts_token_ids_slice = torch.empty(0, dtype=torch.long)
+                tts_hidden_slice = thinker_hidden_states[:0].to(torch.float32).contiguous()
+            elif tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
                 end_idx = tts_eos_idx if tts_eos_idx is not None else thinker_hidden_states.shape[0]
                 tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
                 tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()

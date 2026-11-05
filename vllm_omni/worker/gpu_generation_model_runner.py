@@ -152,6 +152,17 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        declared_width = getattr(self.model_config, "inputs_embeds_size", None)
+        if type(declared_width) is int and declared_width > 0:
+            buffer = self.inputs_embeds.gpu
+            logger.info(
+                "Stage-%s generation inputs_embeds buffer: shape=%s, dtype=%s, device=%s, bytes=%d",
+                self.model_config.stage_id,
+                tuple(buffer.shape),
+                buffer.dtype,
+                buffer.device,
+                buffer.numel() * buffer.element_size(),
+            )
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
         # Whether the previous execute_model call scheduled no tokens; gates
         # the idle prefetch in execute_model.

@@ -189,9 +189,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self.talker = None
 
             if getattr(getattr(vllm_config, "model_config", None), "session_mode", None) == "duplex":
+                from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+                    MiniCPMO45DuplexWindowConfig,
+                )
                 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
                     DUPLEX_WINDOW_BLOCK_SIZE,
-                    duplex_window_geometry,
                     install_duplex_window_layers,
                     validate_duplex_window_install,
                 )
@@ -205,12 +207,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 if max_model_len is None:
                     max_model_len = 8192
 
-                geometry = duplex_window_geometry(
-                    prefix_tokens=96,
-                    window_tokens=6000,
+                geometry = MiniCPMO45DuplexWindowConfig.from_hf_config(config).startup_geometry(
                     block_size=block_size,
                     max_model_len=max_model_len,
-                    high_watermark_tokens=8000,
                 )
                 install_duplex_window_layers(self.thinker, geometry=geometry)
                 validate_duplex_window_install(
@@ -872,6 +871,42 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
+
+    def refresh_omni_output_after_replay(
+        self,
+        model_outputs: OmniOutput,
+        *,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> OmniOutput:
+        """Rebuild V1 Thinker metadata that Python forward cannot refresh in a graph.
+
+        Ordinary eager/direct forwards retain their existing output contract.
+        The runner calls this hook only after restoring a graph replay's tuple.
+        """
+        if self.model_stage != "llm" or getattr(self, "_use_v2_model_runner", False):
+            return model_outputs
+        outputs = dict(model_outputs.multimodal_outputs or {})
+        outputs["latent"] = model_outputs.text_hidden_states
+        if input_ids is not None:
+            outputs["latent_input_ids"] = input_ids.reshape(-1, 1)
+        if positions is not None:
+            # Match forward's first position row for a batched/MRoPE input.
+            row_positions = positions[0] if positions.ndim > 1 else positions
+            outputs["latent_positions"] = row_positions.reshape(-1, 1)
+        # A B1 graph is reused across appends and sessions. Never publish a
+        # Python prompt snapshot or host token metadata retained from capture.
+        outputs.pop("duplex_prompt_token_ids", None)
+        outputs.pop("meta", None)
+        infos = runtime_additional_information or []
+        if any(isinstance(info, dict) and info.get("_omni_is_prefill") is True for info in infos):
+            # vLLM may dispatch a one-token prefill tail as uniform decode.
+            # The live preprocess flag still marks it as prefill, so its new
+            # snapshot is emitted here. Decode inherits the accumulator's last
+            # published snapshot without copying the whole prompt each token.
+            outputs.update(_duplex_row_outputs(infos))
+        return model_outputs._replace(multimodal_outputs=outputs)
 
     def make_omni_output_mrv2(self, model_outputs, *, input_batch, req_states, model_intermediate_buffer):
         """Attach the Thinker row identities used by the llm2tts bridge."""
@@ -1829,6 +1864,26 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     def _duplex_boundary_chunk_eos_probs(logits: torch.Tensor, chunk_eos_id: int) -> torch.Tensor:
         """Per-row ``softmax(logits)[:, chunk_eos_id]`` as ``exp(l_eos - logsumexp(l))``."""
         return torch.exp(logits[:, chunk_eos_id] - torch.logsumexp(logits, dim=-1))
+
+    def process_weights_after_loading(self) -> None:
+        """Optionally place the Thinker's token table in pinned host memory."""
+        if self.model_stage != "llm":
+            return
+        enabled = (getattr(self.vllm_config, "additional_config", None) or {}).get("cpu_token_embedding_uva", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("cpu_token_embedding_uva must be a boolean")
+        if not enabled:
+            return
+        from .token_embedding_offload import enable_token_embedding_uva
+
+        llm = self.thinker.llm
+        offloaded_bytes = enable_token_embedding_uva(llm.model.embed_tokens, llm.lm_head, self.vllm_config)
+        if offloaded_bytes:
+            logger.info(
+                "MiniCPM-o token embedding UVA: %.3f GiB in pinned CPU memory; "
+                "GPU lookup reads selected rows (separate from decoder cpu_offload_gb)",
+                offloaded_bytes / 2**30,
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""

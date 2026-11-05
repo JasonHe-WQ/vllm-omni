@@ -1552,9 +1552,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                 str(token2wav_path),
                 float16=use_float16,
                 n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
-                # The batched backend builds its estimator caches itself and
-                # never runs the upstream chunk path that owns these buffers.
-                drop_upstream_chunk_att_buffers=read_bool_flag(extra, "cfm_drop_upstream_att_buffer", False),
+                # S3 is only needed to prepare reference codec IDs; leave its
+                # weights on CPU instead of moving them for each audio chunk.
+                audio_tokenizer_device="cpu" if read_bool_flag(extra, "token2wav_s3_on_cpu", False) else None,
+                # This stage always uses BatchedToken2Wav's own caches. Drop
+                # the unused upstream chunk workspace before device transfer;
+                # the shared Token2wav facade keeps it for real chunk callers.
+                drop_upstream_chunk_att_buffers=read_bool_flag(extra, "cfm_drop_upstream_att_buffer", True),
             )
         finally:
             torch.set_default_dtype(previous_dtype)

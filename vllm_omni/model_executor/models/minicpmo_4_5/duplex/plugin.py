@@ -769,7 +769,15 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                 code="unsupported_ref_audio_path",
             )
         runtime_config: dict[str, object] = {"instructions": config.instructions}
-        window_config = self._pop_window_config(extra_body) or MiniCPMO45DuplexWindowConfig()
+        deployment_window = MiniCPMO45DuplexWindowConfig.from_hf_config(getattr(model_config, "hf_config", None))
+        window_config = self._pop_window_config(extra_body, defaults=deployment_window) or deployment_window
+        if window_config.basic_window_high_tokens > deployment_window.basic_window_high_tokens:
+            raise MiniCPMO45ClientRuntimeConfigError(
+                f"basic_window_high_tokens={window_config.basic_window_high_tokens} exceeds the deployment "
+                f"limit {deployment_window.basic_window_high_tokens}; raise hf_overrides.duplex_window_high_tokens "
+                "and restart the server before requesting a larger window",
+                code="invalid_sliding_window_config",
+            )
         runtime_config["duplex_window_config"] = window_config.as_dict()
         # ``duplex_initial_user_text`` is the older extra_body spelling and
         # still works; the session field is the framework-level one.
@@ -843,7 +851,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         runtime_config = deepcopy(dict(current))
         extra_body = dict(config.extra_body)
-        requested_window = self._pop_window_config(extra_body)
+        current_window = MiniCPMO45DuplexWindowConfig.from_mapping(runtime_config.get("duplex_window_config"))
+        requested_window = self._pop_window_config(extra_body, defaults=current_window)
         if requested_window is not None:
             reject_changed_runtime_value(
                 requested_window.as_dict(),
@@ -878,7 +887,9 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return runtime_config
 
     @staticmethod
-    def _pop_window_config(extra_body: dict[str, object]) -> MiniCPMO45DuplexWindowConfig | None:
+    def _pop_window_config(
+        extra_body: dict[str, object], *, defaults: MiniCPMO45DuplexWindowConfig | None = None
+    ) -> MiniCPMO45DuplexWindowConfig | None:
         names = (
             "sliding_window_mode",
             "basic_window_high_tokens",
@@ -890,7 +901,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         if not provided:
             return None
         try:
-            return MiniCPMO45DuplexWindowConfig.from_mapping(provided)
+            return MiniCPMO45DuplexWindowConfig.from_mapping(provided, defaults=defaults)
         except ValueError as exc:
             raise MiniCPMO45ClientRuntimeConfigError(str(exc), code="invalid_sliding_window_config") from exc
 

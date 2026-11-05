@@ -269,3 +269,42 @@ def test_logged_stage_table_has_no_phase_split_rows_when_unobserved(monkeypatch)
 
     assert "stage_gen_time_ms" in rows
     assert not set(_PHASE_FIELDS) & set(rows)
+
+
+def test_stage_snapshot_preserves_the_last_observed_phase_group() -> None:
+    from dataclasses import replace
+
+    event = StageRequestStats(
+        batch_id=1,
+        batch_size=1,
+        num_tokens_in=128,
+        num_tokens_out=4,
+        stage_gen_time_ms=20.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+        stage_id=0,
+        vllm_queued_ms=2.0,
+        vllm_prefill_ms=5.0,
+        vllm_decode_ms=12.0,
+        vllm_num_preemptions=0,
+    )
+    merge = OrchestratorAggregator._merge_stage_metric_event
+    snapshot = merge(None, event)
+    expected = {field: getattr(event, field) for field in _PHASE_FIELDS}
+    assert {field: snapshot[field] for field in _PHASE_FIELDS} == expected
+
+    missing = replace(event, **dict.fromkeys(_PHASE_FIELDS))
+    snapshot = merge(snapshot, missing)
+    assert {field: snapshot[field] for field in _PHASE_FIELDS} == expected
+
+    # A newer, partially observed request replaces the whole phase group.
+    # Do not mix its measured zero with an older request's queue/prefill.
+    partial = replace(missing, vllm_decode_ms=0.0)
+    snapshot = merge(snapshot, partial)
+    assert {field: snapshot[field] for field in _PHASE_FIELDS} == {
+        **dict.fromkeys(_PHASE_FIELDS),
+        "vllm_decode_ms": 0.0,
+    }
+    assert not set(_PHASE_FIELDS) & set(merge(None, event, collect_stage_metrics=False))

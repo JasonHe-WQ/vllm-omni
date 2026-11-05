@@ -2340,6 +2340,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # CUDAGraphWrapper's weak_ref_tensors preserves the fields but turns
         # NamedTuple outputs into plain tuples. Restore the Omni envelope
         # before a model adapter or extraction discards its multimodal fields.
+        restored_graph_output = False
         if (
             getattr(self.model, "have_multimodal_outputs", False)
             and type(model_output) is tuple
@@ -2347,8 +2348,18 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             and (model_output[1] is None or isinstance(model_output[1], dict))
         ):
             model_output = OmniOutput(*model_output)
+            restored_graph_output = True
         if not isinstance(model_output, (OmniOutput, IntermediateTensors)) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
+        if restored_graph_output:
+            refresh_output = getattr(self.model, "refresh_omni_output_after_replay", None)
+            if callable(refresh_output):
+                model_output = refresh_output(
+                    model_output,
+                    input_ids=input_ids,
+                    positions=positions,
+                    runtime_additional_information=model_kwargs_extra.get("runtime_additional_information"),
+                )
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output

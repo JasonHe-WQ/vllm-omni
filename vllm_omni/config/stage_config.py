@@ -351,6 +351,9 @@ class StagePipelineConfig:
     hf_config_name: str | None = None
     engine_output_type: str | None = None
     model_arch: str | None = None
+    # Width returned by this stage's embed_input_ids, when it differs from
+    # checkpoint hidden_size. Sizes runner staging only, not model weights/KV.
+    inputs_embeds_size: int | None = None
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
@@ -1366,6 +1369,8 @@ def _build_engine_args(
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
+    if ps.inputs_embeds_size is not None:
+        engine_args["inputs_embeds_size"] = ps.inputs_embeds_size
     if not ps.supports_running_prefix_cache_reset:
         engine_args["supports_running_prefix_cache_reset"] = False
     if ps.execution_type is StageExecutionType.LLM_AR and ps.recompute_preemption != "allow":

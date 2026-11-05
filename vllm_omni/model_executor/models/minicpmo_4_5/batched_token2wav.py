@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.utils.device_copy import index_to_device
+from vllm_omni.utils.torch_compile import _undecorate_dynamo
 
 from .cuda_graph_wrapper import (
     CFMGraphWrapper,
@@ -296,25 +297,6 @@ class PromptFeatures:
 class BatchedToken2WavState:
     flow_cache: dict[str, torch.Tensor]
     hift_cache: dict[str, torch.Tensor]
-
-
-def _undecorate_dynamo(module: nn.Module, method: str) -> None:
-    """Restore ``method`` on ``module`` if TorchDynamo wrapped it.
-
-    ``cosyvoice2`` decorates ``UpsampleConformerEncoderV2.forward_chunk`` with
-    ``torch.compile(backend="eager")``. That backend performs no Inductor
-    optimisation, so the wrapper only adds tracing and guard construction, and
-    duplex pays it again on every unseen chunk shape -- seconds inside a live
-    response. Dropping the wrapper leaves the original implementation, which is
-    what the eager backend was executing anyway.
-    """
-    bound = getattr(module, method, None)
-    original = getattr(bound, "_torchdynamo_orig_callable", None) or getattr(bound, "__wrapped__", None)
-    if original is None:
-        return
-    function = getattr(original, "__func__", original)
-    module.__dict__[method] = function.__get__(module, type(module))
-    logger.info("Bypassed TorchDynamo wrapper on %s.%s", type(module).__name__, method)
 
 
 def _cfm_matmul_tf32(fn):
@@ -1327,6 +1309,7 @@ class BatchedToken2Wav(nn.Module):
         valid_lengths: list[int] | None = None,
         att_keep: tuple[int, int] | None = None,
         prompt_lengths: list[int] | None = None,
+        allow_eager_att_handoff: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1338,6 +1321,9 @@ class BatchedToken2Wav(nn.Module):
         request (the Whole-Euler path). A Whole-Euler solve returns the new
         cache in the same form, already trimmed by ``att_keep``; the eager
         path returns it stacked and untrimmed (ragged: per request, untrimmed).
+        A consumer opting into ``allow_eager_att_handoff`` receives one owned,
+        already-trimmed row for a plain B1 eager solve. This avoids building a
+        full ten-step cache only to copy it again while splitting requests.
         """
         decoder = self.flow.decoder
         estimator = decoder.estimator
@@ -1473,6 +1459,16 @@ class BatchedToken2Wav(nn.Module):
         next_cnn: list[torch.Tensor] = []
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None
+        handoff_attention = (
+            allow_eager_att_handoff
+            and batch_size == 1
+            and valid_lengths is None
+            and pad_frames == 0
+            and not self._cfm_graph_enabled
+            and self._cfm_graph_wrapper is None
+            and self._whole_euler_graph_wrapper is None
+            and self._trt_stepper is None
+        )
         with _token2wav_sdpa_context(mu.device):
             for step in range(self.n_timesteps):
                 old_cnn = cnn_cache[step] if cnn_cache is not None else None
@@ -1529,13 +1525,23 @@ class BatchedToken2Wav(nn.Module):
                                 )
                     del step_att
                     continue
+                keep_ranges = _att_keep_ranges(int(step_att.shape[-2]), att_keep) if handoff_attention else None
                 if next_att_cache is None:
+                    shape = (self.n_timesteps, *step_att.shape)
+                    if keep_ranges is not None:
+                        shape = (*shape[:-2], sum(length for _, length in keep_ranges), shape[-1])
                     next_att_cache = torch.empty(
-                        (self.n_timesteps, *step_att.shape),
+                        shape,
                         device=step_att.device,
                         dtype=self._estimator_att_cache_dtype,
                     )
-                next_att_cache[step].copy_(step_att)
+                if keep_ranges is None:
+                    next_att_cache[step].copy_(step_att)
+                else:
+                    # Copy exactly the same prefix/tail slices the request
+                    # splitter would keep, directly into its final storage.
+                    # The old request cache remains read-only throughout.
+                    _copy_frame_segments(next_att_cache[step], step_att, keep_ranges)
                 if pad_frames:
                     # The padded steps ran but hold no valid content, and each
                     # cache entry becomes the next chunk's keys. Clear the
@@ -1548,6 +1554,8 @@ class BatchedToken2Wav(nn.Module):
         if ragged_att_cache is not None:
             return x, torch.stack(next_cnn), ragged_att_cache
         assert next_att_cache is not None
+        if handoff_attention:
+            return x, torch.stack(next_cnn), [next_att_cache]
         return x, torch.stack(next_cnn), next_att_cache
 
     def _split_flow_cache(
@@ -1634,8 +1642,13 @@ class BatchedToken2Wav(nn.Module):
         return result
 
     @staticmethod
-    def _stack_estimator_att(rows: list[torch.Tensor]) -> torch.Tensor:
-        """Stack per-request ``(n_t, depth, 2, ...)`` caches into CFG order ``[cond x B | uncond x B]``."""
+    def _stack_estimator_att(rows: list[torch.Tensor], *, borrow_single: bool = False) -> torch.Tensor:
+        """Stack caches into CFG order; verified eager consumers may borrow one read-only row."""
+        if borrow_single and len(rows) == 1 and isinstance(rows[0], torch.Tensor):
+            # B=1 already has [conditional, unconditional] order. Consumers
+            # write separate output buffers, including when a setup state is
+            # shared with another request. Graph/TRT callers keep the copy.
+            return rows[0]
         rows = _materialize_att_rows(rows)
         return torch.cat((*[row[:, :, 0:1] for row in rows], *[row[:, :, 1:2] for row in rows]), dim=2)
 
@@ -1666,7 +1679,10 @@ class BatchedToken2Wav(nn.Module):
             ),
             "estimator_cnn_cache": torch.cat((*conditional_cnn, *unconditional_cnn), dim=2),
             "estimator_att_cache": (
-                self._stack_estimator_att([flow["estimator_att_cache"] for flow in flows])
+                self._stack_estimator_att(
+                    [flow["estimator_att_cache"] for flow in flows],
+                    borrow_single=not self._cfm_graph_enabled and self._trt_stepper is None,
+                )
                 if include_estimator_att
                 else None
             ),
@@ -1772,7 +1788,18 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=None,
                 att_cache=None,
                 att_keep=(int(prompt_mels.shape[1]), _CACHE_TRIM_SUFFIX),
+                allow_eager_att_handoff=True,
             )
+        # _decode_cfm assembles owned storage even when individual steps use
+        # graph-owned buffers; Whole-Euler also copies its arena outputs out.
+        # B=1 setup needs no trim or CFG reorder, so pass that owned row to the
+        # splitter directly instead of copying the full prompt cache again.
+        if (
+            batch_size == 1
+            and isinstance(estimator_att, torch.Tensor)
+            and estimator_att.dtype == self._estimator_att_cache_dtype
+        ):
+            estimator_att = [estimator_att]
         flow_cache = {
             "conformer_cnn_cache": conformer_cnn,
             "conformer_att_cache": conformer_att,
@@ -1962,8 +1989,13 @@ class BatchedToken2Wav(nn.Module):
                 ),
                 att_keep=att_keep,
                 prompt_lengths=prompt_lengths,
+                allow_eager_att_handoff=True,
             )
 
+        # The solve has finished reading its stacked inputs. In eager mode
+        # the old attention copy alone can occupy hundreds of MiB; release it
+        # before splitting the new cache and before HiFT requests workspace.
+        del flow_cache
         conformer_att = _trim_streaming_cache(conformer_att, prompt_len)
         new_flow = self._split_flow_cache(
             {
@@ -1975,6 +2007,9 @@ class BatchedToken2Wav(nn.Module):
             batch_size,
             estimator_att_keep=att_keep,
         )
+        # Split outputs own their storage (or retain their graph-owned rows).
+        # Do not keep the unsplit eager outputs alive through the vocoder.
+        del estimator_att, estimator_cnn, conformer_att, conformer_cnn
         for cache, row_prompt_len in zip(new_flow, prompt_lengths, strict=True):
             for name in ("conformer_att_cache", "estimator_att_cache"):
                 cache[name] = _trim_streaming_cache(cache[name], row_prompt_len)

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -175,6 +176,73 @@ def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() ->
     restored = _restore_weight_norm_weight(weight_g, weight_v)
 
     assert torch.equal(restored, linear.weight)
+
+
+def test_native_talker_drops_unused_backbone_embedding_and_loads_checkpoint(monkeypatch) -> None:
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+    import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as tts_module
+
+    class Backbone(nn.Module):
+        def __init__(self, *, vllm_config, prefix):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(32, 4)
+            self.proj = nn.Linear(4, 4, bias=False)
+            self.make_empty_intermediate_tensors = lambda *args: None
+
+        def load_weights(self, weights):
+            return AutoWeightsLoader(self).load_weights(weights)
+
+        def forward(self, *, inputs_embeds, **kwargs):
+            return self.proj(inputs_embeds)
+
+    monkeypatch.setattr(tts_module, "LlamaModel", Backbone)
+    talker = _make_talker()
+    talker._tts_config = ConditionalChatTTSConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        num_text_tokens=16,
+        num_audio_tokens=8,
+        num_vq=1,
+        llm_dim=4,
+    )
+    talker.vllm_config = SimpleNamespace(
+        with_hf_config=lambda *args, **kwargs: SimpleNamespace(model_config=SimpleNamespace())
+    )
+    talker._init_native_talker("")
+    assert talker.tts_model.embed_tokens is None
+    assert not any("embed_tokens" in name for name, _ in talker.named_parameters())
+
+    generator = torch.Generator().manual_seed(11)
+    expected = {name: torch.randn(param.shape, generator=generator) for name, param in talker.named_parameters()}
+    weights = [
+        ("tts.model.proj.weight", expected["tts_model.proj.weight"]),
+        # Must be ignored rather than passed to AutoWeightsLoader's None module.
+        ("tts.model.embed_tokens.weight", torch.ones(32, 4)),
+    ]
+    weights += [
+        (f"tts.{name}", value)
+        for name, value in expected.items()
+        if not name.startswith("tts_model.") and name != "head_code.0.weight"
+    ]
+    head_v = expected["head_code.0.weight"]
+    head_g = head_v.norm(dim=1, keepdim=True)
+    weights += [
+        ("tts.head_code.0.parametrizations.weight.original0", head_g),
+        ("tts.head_code.0.parametrizations.weight.original1", head_v),
+    ]
+    loaded = talker.load_weights(iter(weights))
+    assert loaded == set(expected)
+    for name, param in talker.named_parameters():
+        torch.testing.assert_close(param, expected[name])
+    ids = torch.tensor([1, 3])
+    embeds = talker.get_input_embeddings(ids)
+    torch.testing.assert_close(embeds, expected["emb_code.0.weight"][ids])
+    output = talker(input_ids=None, positions=torch.arange(2), intermediate_tensors=None, inputs_embeds=embeds)
+    torch.testing.assert_close(output, embeds @ expected["tts_model.proj.weight"].T)
 
 
 def test_batched_repetition_penalty_matches_request_local_rows() -> None:

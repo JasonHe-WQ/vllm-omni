@@ -1,12 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     MiniCPMO45DuplexPolicy,
+    MiniCPMO45DuplexWindowConfig,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("hf_config", "high", "low", "resident_bound"),
+    [
+        (None, 8000, 6000, 8097),
+        (SimpleNamespace(), 8000, 6000, 8097),
+        (SimpleNamespace(duplex_window_high_tokens=16000, duplex_window_low_tokens=12000), 16000, 12000, 16097),
+    ],
+)
+def test_deployment_geometry_and_session_defaults_share_watermarks(hf_config, high, low, resident_bound):
+    config = MiniCPMO45DuplexWindowConfig.from_hf_config(hf_config)
+    geometry = config.startup_geometry(block_size=16, max_model_len=16384)
+
+    assert (config.basic_window_high_tokens, config.basic_window_low_tokens) == (high, low)
+    assert (geometry.trigger_tokens, geometry.window_tokens) == (high, low)
+    # Session watermarks count the prefix; startup keeps its historical extra
+    # prefix allowance, so default 8k admission/cache sizing stays unchanged.
+    assert geometry.prefix_tokens + geometry.trigger_tokens + geometry.sample_room == resident_bound
+
+
+@pytest.mark.parametrize(
+    ("high", "low"),
+    [(True, 6000), (16000, False), (0, 6000), (16000, 0), (16000, 16000), (16000, 17000)],
+)
+def test_invalid_deployment_watermarks_fail_before_model_setup(high, low):
+    with pytest.raises(ValueError):
+        MiniCPMO45DuplexWindowConfig.from_hf_config(
+            SimpleNamespace(duplex_window_high_tokens=high, duplex_window_low_tokens=low)
+        )
 
 
 @pytest.mark.parametrize(

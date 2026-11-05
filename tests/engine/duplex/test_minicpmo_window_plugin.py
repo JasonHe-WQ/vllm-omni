@@ -45,6 +45,72 @@ async def test_window_defaults_to_basic_and_can_be_disabled(monkeypatch, extra_b
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra_body", "expected"),
+    [
+        ({}, (16000, 12000)),
+        ({"basic_window_low_tokens": 11000}, (16000, 11000)),
+        ({"basic_window_high_tokens": 512, "basic_window_low_tokens": 256}, (512, 256)),
+    ],
+)
+async def test_deployment_watermarks_supply_session_defaults(monkeypatch, extra_body, expected):
+    _stub_tokenizer(monkeypatch)
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(duplex_window_high_tokens=16000, duplex_window_low_tokens=12000)
+    )
+    config = DuplexSessionConfig(modalities=("text",), extra_body=dict(extra_body))
+
+    runtime = await _plugin().prepare_runtime_config(config, model_config=model_config)
+
+    window = runtime["duplex_window_config"]
+    assert (window["basic_window_high_tokens"], window["basic_window_low_tokens"]) == expected
+    assert config.extra_body == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["basic", "context", "off"])
+async def test_session_watermarks_cannot_exceed_deployment_capacity(mode):
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(duplex_window_high_tokens=16000, duplex_window_low_tokens=12000)
+    )
+    config = DuplexSessionConfig(
+        modalities=("text",),
+        extra_body={"sliding_window_mode": mode, "basic_window_high_tokens": 16001},
+    )
+
+    with pytest.raises(module.MiniCPMO45ClientRuntimeConfigError, match="exceeds the deployment limit 16000") as exc:
+        await _plugin().prepare_runtime_config(config, model_config=model_config)
+
+    assert exc.value.code == "invalid_sliding_window_config"
+
+
+def test_partial_window_update_preserves_created_deployment_defaults():
+    current = {
+        "duplex_window_config": module.MiniCPMO45DuplexWindowConfig.from_hf_config(
+            SimpleNamespace(duplex_window_high_tokens=16000, duplex_window_low_tokens=12000)
+        ).as_dict()
+    }
+    config = DuplexSessionConfig(extra_body={"sliding_window_mode": "basic"})
+
+    result = _plugin().runtime_config_for_update(config, current)
+
+    assert result["duplex_window_config"] == current["duplex_window_config"]
+    assert set(current) == {"duplex_window_config"}
+    assert config.extra_body == {}
+    assert result is not current
+
+
+def test_window_update_cannot_shrink_created_deployment_watermark():
+    current = {"duplex_window_config": {"basic_window_high_tokens": 16000, "basic_window_low_tokens": 12000}}
+    config = DuplexSessionConfig(extra_body={"basic_window_low_tokens": 11000})
+
+    with pytest.raises(module.MiniCPMO45ClientRuntimeConfigError) as exc:
+        _plugin().runtime_config_for_update(config, current)
+
+    assert exc.value.code == "sliding_window_update_unsupported"
+
+
+@pytest.mark.asyncio
 async def test_window_configuration_is_prepared_by_plugin(monkeypatch):
     _stub_tokenizer(monkeypatch)
     config = DuplexSessionConfig(

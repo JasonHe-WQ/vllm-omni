@@ -461,6 +461,31 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
 
 
+@pytest.mark.parametrize("source", ["deploy", "stage-cli"])
+def test_stage_cpu_offload_survives_structured_projection(source):
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    values = {"cpu_offload_gb": 2.0, "offload_backend": "uva"}
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras=values if source == "deploy" else {})])
+    config = VllmOmniConfig.from_pipeline_config(
+        _resolve_pipeline_or_skip("qwen3_tts"),
+        user_deploy_config=deploy,
+        cli_overrides={f"stage_0_{key}": value for key, value in values.items()} if source == "stage-cli" else {},
+    )
+    # Workers receive the serialized structured stage, not the original YAML.
+    stage = ForkingPickler.loads(ForkingPickler.dumps(config.stage_by_id(0)))
+    assert stage.offload_config.cpu_offload_gb == 2.0
+    assert stage.offload_config.offload_backend == "uva"
+    projected = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    engine_args = OmniEngineArgs(**projected)
+    assert engine_args.cpu_offload_gb == 2.0
+    assert engine_args.offload_backend == "uva"
+    other_stage = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(1), model="test-model")
+    assert "cpu_offload_gb" not in other_stage
+    assert "offload_backend" not in other_stage
+
+
 _MODEL_CLI_FLAGS = {
     "served_model_name": "omni",
     "allowed_local_media_path": "/data",
@@ -1059,6 +1084,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "model_config",
         "load_config",
         "cache_config",
+        "offload_config",
         "scheduler_config",
         "pooling_config",
         "connector_config",
@@ -1135,6 +1161,7 @@ def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
         "model",
         "model_arch",
+        "inputs_embeds_size",
         "revision",
         "tokenizer_revision",
         "code_revision",

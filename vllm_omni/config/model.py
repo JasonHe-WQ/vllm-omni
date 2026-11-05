@@ -4,7 +4,7 @@
 from dataclasses import MISSING, field
 from typing import Any, Literal
 
-from pydantic import ConfigDict, TypeAdapter
+from pydantic import ConfigDict, Field, TypeAdapter
 from transformers import PretrainedConfig
 from vllm.config import ModelConfig
 from vllm.config.utils import config
@@ -139,6 +139,9 @@ class OmniModelConfig(ModelConfig):
     duplex_max_sessions: int = 1
     model_stage: str = "thinker"
     model_arch: str | None = None
+    # Pipeline-owned input adapter width; leave the checkpoint architecture
+    # and hidden_size untouched for weight loading and attention geometry.
+    inputs_embeds_size: int | None = Field(default=None, ge=1)
     worker_type: str | None = None
     engine_output_type: str | None = None
     # Optional dotted path of a per-stage pooling-output decoder applied
@@ -202,6 +205,8 @@ class OmniModelConfig(ModelConfig):
         return super().embedding_size
 
     def get_inputs_embeds_size(self) -> int:
+        if self.inputs_embeds_size is not None:
+            return self.inputs_embeds_size
         if self.hf_config_name is not None:
             stage_config = getattr(self.hf_config, self.hf_config_name, None)
             override = getattr(stage_config, "embedding_size", None)

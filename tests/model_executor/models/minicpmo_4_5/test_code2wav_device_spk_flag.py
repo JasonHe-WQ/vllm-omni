@@ -97,6 +97,21 @@ def test_unset_or_true_enables_the_device_embedding(tmp_path, monkeypatch, npu_p
     assert token2wav.device_spk_calls == 1
 
 
+@pytest.mark.parametrize(
+    ("extra", "drop_buffers"),
+    [
+        ({}, True),
+        ({"cfm_drop_upstream_att_buffer": None}, True),
+        ({"cfm_drop_upstream_att_buffer": "false"}, False),
+    ],
+)
+def test_batched_backend_drops_unused_chunk_attention_buffers_by_default(
+    tmp_path, monkeypatch, npu_platform, extra, drop_buffers
+):
+    _, token2wav = _build_backend(tmp_path, monkeypatch, extra)
+    assert token2wav.kwargs["drop_upstream_chunk_att_buffers"] is drop_buffers
+
+
 @pytest.mark.parametrize("value", ["maybe", "yes", 2, 1.5, []])
 def test_invalid_value_is_rejected(tmp_path, monkeypatch, npu_platform, value):
     with pytest.raises(ValueError, match="token2wav_device_spk"):
@@ -114,6 +129,7 @@ def test_invalid_value_is_rejected_off_npu_too(tmp_path, monkeypatch):
 
 _OTHER_DEFAULTS = {
     "token2wav_float16",
+    "token2wav_s3_on_cpu",
     "token2wav_trt",
     "code2wav_bfloat16_attention_cache",
     "cfm_graph_precapture",
@@ -133,6 +149,15 @@ _OTHER_DEFAULTS = {
     "cfm_precapture_empty_cache",
     "cfm_drop_upstream_att_buffer",
 }
+
+
+@pytest.mark.parametrize(
+    ("extra", "tokenizer_device"),
+    [({}, None), ({"token2wav_s3_on_cpu": True}, "cpu"), ({"token2wav_s3_on_cpu": "false"}, None)],
+)
+def test_s3_cpu_placement_is_opt_in(tmp_path, monkeypatch, npu_platform, extra, tokenizer_device):
+    _, token2wav = _build_backend(tmp_path, monkeypatch, extra)
+    assert token2wav.kwargs["audio_tokenizer_device"] == tokenizer_device
 
 
 @pytest.mark.parametrize("key", sorted(_OTHER_DEFAULTS))
